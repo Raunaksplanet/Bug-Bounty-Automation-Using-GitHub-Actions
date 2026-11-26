@@ -1,0 +1,117 @@
+# Example only. This file sits outside .github/workflows so GitHub never runs it.
+# Copy it to .github/workflows/recon.yml in a private repository to use it.
+
+name: Subdomain recon
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recon-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET: dell.com
+  HTTPX_THREADS: '50'
+
+jobs:
+  recon:
+    name: Recon ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 'stable'
+
+      - name: Cache Go build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-tools-${{ runner.os }}-subfinder-2.17.0-httpx-1.12.0
+
+      - name: Install tools
+        run: |
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@v2.17.0
+          go install github.com/projectdiscovery/httpx/cmd/httpx@v1.12.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Enumerate subdomains
+        run: |
+          mkdir -p results
+          subfinder -d "$TARGET" -all -silent -o results/subdomains.txt
+          count=$(wc -l < results/subdomains.txt)
+          echo "subdomains: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::subfinder returned no subdomains"
+            exit 1
+          fi
+
+      - name: Probe HTTP
+        run: |
+          httpx -l results/subdomains.txt \
+            -silent \
+            -threads "$HTTPX_THREADS" \
+            -timeout 10 \
+            -retries 1 \
+            -json \
+            -o results/httpx.jsonl
+          count=$(wc -l < results/httpx.jsonl)
+          echo "live hosts: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::httpx returned no live hosts"
+            exit 1
+          fi
+
+      - name: Build status reports
+        run: |
+          jq -r '"\(.status_code)\t\(.url)\t\(if (.title // "") == "" then "-" else .title end)"' \
+            results/httpx.jsonl | sort -n > results/status.txt
+
+          for class in 2 3 4 5; do
+            jq -r --argjson lo "${class}00" --argjson hi "$((class + 1))00" \
+              'select(.status_code >= $lo and .status_code < $hi) | "\(.status_code)\t\(.url)"' \
+              results/httpx.jsonl | sort -n > "results/${class}xx.txt"
+          done
+
+          {
+            echo "target: $TARGET"
+            echo "generated: $(date -u +%FT%TZ)"
+            echo
+            echo "subdomains: $(wc -l < results/subdomains.txt)"
+            echo "live hosts: $(wc -l < results/status.txt)"
+            for class in 2 3 4 5; do
+              printf "%sxx: %s\n" "$class" "$(wc -l < "results/${class}xx.txt")"
+            done
+          } > results/summary.txt
+
+          cat results/summary.txt
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: recon-${{ github.run_number }}
+          path: results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Subdomain recon: $TARGET"
+            echo
+            echo '```'
+            cat results/summary.txt 2>/dev/null || echo "no results"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
